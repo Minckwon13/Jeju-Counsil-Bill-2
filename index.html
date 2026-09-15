@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>제주특별자치도의회 13대 의안 요약 대시보드</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 antialiased">
+  <div class="max-w-5xl mx-auto px-4 py-8">
+    <!-- Header -->
+    <header class="mb-8 border-b pb-4">
+      <h1 class="text-3xl font-bold text-blue-900">제주특별자치도의회 13대 의안 요약</h1>
+      <p class="text-gray-600 mt-2">수집된 의안 원안(HWP)의 핵심 제안 이유 및 주요 내용을 AI로 요약한 목록입니다.</p>
+    </header>
+
+    <!-- Content List -->
+    <main id="bill-container" class="space-y-6">
+      <div class="text-center py-12 text-gray-500">데이터를 불러오는 중입니다...</div>
+    </main>
+  </div>
+
+  <script>
+    async function loadBills() {
+      const container = document.getElementById('bill-container');
+      try {
+        const response = await fetch('data.json');
+        if (!response.ok) throw new Error("JSON 데이터를 찾을 수 없습니다.");
+        const bills = await response.json();
+
+        container.innerHTML = '';
+        bills.forEach(bill => {
+          const card = document.createElement('div');
+          card.className = "bg-white p-6 rounded-lg shadow-sm border border-gray-200 hover:shadow-md transition";
+          
+          // 요약 텍스트줄 바꿈 처리
+          const formattedSummary = bill.summary.replace(/\n/g, '<br>');
+
+          card.innerHTML = `
+            <h2 class="text-xl font-semibold text-gray-900 mb-2">${bill.title}</h2>
+            
+            <div class="flex flex-wrap gap-3 text-sm mb-4">
+              <a href="${bill.detail_url}" target="_blank" class="text-blue-600 hover:underline font-medium">
+                🔗 의안 상세페이지
+              </a>
+              ${bill.file_url ? `
+                <a href="${bill.file_url}" target="_blank" class="text-emerald-600 hover:underline font-medium">
+                  📥 원안 파일 다운로드 (${bill.file_name})
+                </a>
+              ` : '<span class="text-gray-400">첨부파일 없음</span>'}
+            </div>
+
+            <div class="bg-gray-50 p-4 rounded-md border text-gray-700 text-sm leading-relaxed">
+              <strong class="block text-gray-900 mb-1">📋 주요 요약 내용:</strong>
+              <div>${formattedSummary}</div>
+            </div>
+          `;
+          container.appendChild(card);
+        });
+      } catch (error) {
+        container.innerHTML = `<div class="bg-red-50 text-red-600 p-4 rounded-md">에러 발생: ${error.message}</div>`;
+      }
+    }
+
+    loadBills();
+  </script>
+</body>
+</html>
