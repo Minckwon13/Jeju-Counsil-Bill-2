@@ -46,32 +46,27 @@ def get_bills(page):
     return bill_list
 
 def download_file(detail_url):
-    """상세 페이지 접속 후 첨부파일(act=down1) 다운로드"""
+    """상세 페이지 접속 후 첨부파일 다운로드 (파일명 단순화 처리)"""
     res = requests.get(detail_url, headers=HEADERS)
     soup = BeautifulSoup(res.text, 'html.parser')
     
     down_link = soup.find('a', href=re.compile(r'act=down1'))
     if not down_link:
-        # 다운로드 버튼 태그를 찾지 못한 경우 직접 URL 파라미터 구성
         down_url = detail_url.replace('act=view', 'act=down1') + '&judgingNo=1&judgingType=02'
     else:
         href = down_link.get('href')
         down_url = BOARD_URL + href if href.startswith('?') else BASE_URL + href
 
+    # URL에서 의안 번호(bill=XXXXX) 추출하여 안전한 파일명 생성
+    bill_num_match = re.search(r'bill=(\d+)', detail_url)
+    bill_num = bill_num_match.group(1) if bill_num_match else "unknown"
+    safe_filename = f"bill_{bill_num}.hwp"
+    save_path = os.path.join(SAVE_DIR, safe_filename)
+
     try:
         file_res = requests.get(down_url, headers=HEADERS, stream=True)
         if file_res.status_code != 200 or len(file_res.content) < 500:
             return None, None
-
-        filename = "bill_file.hwp"
-        if "Content-Disposition" in file_res.headers:
-            content_disp = file_res.headers["Content-Disposition"]
-            filenames = re.findall(r'filename="?([^"]+)"?', content_disp)
-            if filenames:
-                filename = urllib.parse.unquote(filenames[0].encode('latin1').decode('utf8', 'ignore'))
-
-        filename = re.sub(r'[\\/*?:"<>|]', "", filename)
-        save_path = os.path.join(SAVE_DIR, filename)
 
         with open(save_path, 'wb') as f:
             for chunk in file_res.iter_content(chunk_size=8192):
@@ -79,27 +74,24 @@ def download_file(detail_url):
 
         return save_path, down_url
     except Exception as e:
-        print(f"   └ [다운로드 실패]: {e}")
+        print(f"   └ [다운로드 에러]: {e}")
         return None, None
 
 def extract_hwp_text(file_path):
-    """olefile과 zlib를 사용하여 파이썬 내부에서 HWP 본문 텍스트를 직접 추출합니다."""
-    if not olefile.isOleFile(file_path):
+    """olefile + zlib을 사용해 HWP 본문 텍스트를 내부에서 직접 해독"""
+    if not os.path.exists(file_path) or not olefile.isOleFile(file_path):
         return ""
 
     text = ""
     try:
         ole = olefile.OleFileIO(file_path)
         dirs = ole.listdir()
-        
-        # HWP 문서의 본문 텍스트가 담긴 BodyText 섹션 탐색
         sections = [d for d in dirs if d[0] == 'BodyText']
         
         for section in sections:
             stream = ole.openstream(section)
             data = stream.read()
             
-            # HWP 5.0 압축 해제
             try:
                 decompressed = zlib.decompress(data, -15)
             except Exception:
@@ -108,21 +100,21 @@ def extract_hwp_text(file_path):
                 except Exception:
                     decompressed = data
             
-            # UTF-16LE 텍스트 복원 및 한글/영문 추출
             decoded = decompressed.decode('utf-16le', errors='ignore')
+            # 불필요한 제어문자 제거 및 한글/영문/숫자 정제
             clean_text = re.sub(r'[^가-힣0-9a-zA-Z\s.,\-\(\)]', ' ', decoded)
             text += ' '.join(clean_text.split()) + "\n"
             
         ole.close()
-        return text
+        return text.strip()
     except Exception as e:
-        print(f"   └ [HWP 읽기 실패]: {e}")
+        print(f"   └ [HWP 해독 에러]: {e}")
         return ""
 
 def summarize(text):
-    """OpenAI API를 사용해 의안을 요약합니다."""
+    """OpenAI API를 통해 제안 이유와 주요 내용을 요약"""
     if not text or len(text.strip()) < 30: 
-        return "본문 텍스트를 읽을 수 없어 요약에 실패했습니다."
+        return "본문 텍스트가 부족하여 요약할 수 없습니다."
     
     try:
         response = client.chat.completions.create(
@@ -161,7 +153,7 @@ def main():
         
         for i, bill in enumerate(bills):
             if bill['url'] in existing_urls:
-                print(f" ({i+1}/{len(bills)}) [기존 건 스킵] {bill['title']}")
+                print(f" ({i+1}/{len(bills)}) [기존 의안 - 스킵] {bill['title']}")
                 continue
             
             all_bills_in_page_already_exist = False
@@ -173,7 +165,7 @@ def main():
                 text = extract_hwp_text(file_path)
                 if text:
                     summary = summarize(text)
-                    print("   └ ✅ 요약 성공")
+                    print("   └ ✅ 텍스트 추출 및 요약 성공")
                 else:
                     summary = "HWP 파일 내 텍스트 추출에 실패했습니다."
                     print("   └ ❌ 텍스트 추출 실패")
@@ -190,7 +182,7 @@ def main():
             })
 
         if all_bills_in_page_already_exist and len(bills) > 0:
-            print(f"\n페이지 {page}의 모든 데이터가 이미 수집되어 종료합니다.")
+            print(f"\n페이지 {page}의 모든 데이터가 이미 존재하여 크롤링을 종료합니다.")
             stop_crawling = True
             break
             
@@ -200,9 +192,9 @@ def main():
         final_data = new_bills_data + existing_data
         with open(JSON_OUT, 'w', encoding='utf-8') as f:
             json.dump(final_data, f, ensure_ascii=False, indent=2)
-        print(f"\n[완료] 총 {len(final_data)}개 저장 완료.")
+        print(f"\n[완료] 총 {len(final_data)}개 데이터 저장 완료.")
     else:
-        print("\n[알림] 추가된 신규 의안이 없습니다.")
+        print("\n[알림] 새로 추가할 의안이 없습니다.")
 
 if __name__ == '__main__':
     main()
