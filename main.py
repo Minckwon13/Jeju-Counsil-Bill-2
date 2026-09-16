@@ -22,17 +22,15 @@ def setup():
         os.makedirs(SAVE_DIR)
 
 def load_existing_data():
-    """기존 data.json 파일이 존재하면 데이터를 불러옵니다."""
     if os.path.exists(JSON_OUT):
         try:
             with open(JSON_OUT, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except Exception as e:
-            print(f"기존 data.json 읽기 에러: {e}")
+        except Exception:
+            pass
     return []
 
 def get_bills(page):
-    """특정 페이지의 의안 목록을 수집합니다."""
     url = f"{BOARD_URL}?page={page}"
     res = requests.get(url, headers=HEADERS)
     soup = BeautifulSoup(res.text, 'html.parser')
@@ -48,57 +46,88 @@ def get_bills(page):
     return bill_list
 
 def download_file(detail_url):
-    """의안 상세페이지에서 원안 첨부파일을 다운로드합니다."""
+    """유연한 다운로드 링크 수집 및 주소 직접 구성 백업 함수"""
     res = requests.get(detail_url, headers=HEADERS)
     soup = BeautifulSoup(res.text, 'html.parser')
-    down_link = soup.find('a', href=re.compile(r'act=down1'))
-    if not down_link: 
-        return None, None
+    
+    down_url = None
+    # 1. 태그 내 다운로드 관련 링크 탐색
+    for a in soup.find_all('a'):
+        href = a.get('href', '')
+        onclick = a.get('onclick', '')
+        text = a.text.strip()
         
-    href = down_link.get('href')
-    down_url = BOARD_URL + href if href.startswith('?') else BASE_URL + href
-    file_res = requests.get(down_url, headers=HEADERS, stream=True)
-    
-    filename = "unknown_file.hwp"
-    if "Content-Disposition" in file_res.headers:
-        content_disp = file_res.headers["Content-Disposition"]
-        filenames = re.findall(r'filename="?([^"]+)"?', content_disp)
-        if filenames:
-            filename = urllib.parse.unquote(filenames[0].encode('latin1').decode('utf8', 'ignore'))
-            
-    filename = re.sub(r'[\\/*?:"<>|]', "", filename)
-    save_path = os.path.join(SAVE_DIR, filename)
-    
-    with open(save_path, 'wb') as f:
-        for chunk in file_res.iter_content(chunk_size=8192):
-            f.write(chunk)
-            
-    return save_path, down_url
+        if 'down' in href.lower() or 'down' in onclick.lower() or '원안' in text or '첨부' in text:
+            if href and not href.startswith('javascript'):
+                down_url = BOARD_URL + href if href.startswith('?') else (href if href.startswith('http') else BASE_URL + href)
+                break
+                
+    # 2. 링크를 찾지 못한 경우 URL 파라미터 기반 자동 생성 (act=view -> act=down1)
+    if not down_url:
+        down_url = detail_url.replace('act=view', 'act=down1') + '&judgingNo=1&judgingType=02'
+
+    try:
+        file_res = requests.get(down_url, headers=HEADERS, stream=True)
+        if file_res.status_code != 200 or len(file_res.content) < 1000:
+            return None, None
+
+        filename = "bill_file.hwp"
+        if "Content-Disposition" in file_res.headers:
+            content_disp = file_res.headers["Content-Disposition"]
+            filenames = re.findall(r'filename="?([^"]+)"?', content_disp)
+            if filenames:
+                filename = urllib.parse.unquote(filenames[0].encode('latin1').decode('utf8', 'ignore'))
+
+        filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+        save_path = os.path.join(SAVE_DIR, filename)
+
+        with open(save_path, 'wb') as f:
+            for chunk in file_res.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return save_path, down_url
+    except Exception as e:
+        print(f"   └ [다운로드 에러]: {e}")
+        return None, None
 
 def extract_hwp_text(file_path):
-    """pyhwp 패키지를 활용해 HWP 파일에서 텍스트를 추출합니다."""
+    """hwp5txt 실행 및 바이너리 직접 분석을 포함한 이중 텍스트 추출"""
     txt_path = file_path + ".txt"
+    text = ""
+    
+    # 1차: pyhwp / hwp5txt 도구 활용
     try:
         cmd = [sys.executable, "-m", "hwp5.hwp5txt", "--output", txt_path, file_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            subprocess.run(["hwp5txt", "--output", txt_path, file_path], check=True, capture_output=True)
-            
+        subprocess.run(cmd, check=True, capture_output=True)
         with open(txt_path, 'r', encoding='utf-8') as f:
             text = f.read()
-        return text
-    except Exception as e:
-        print(f"   └ [오류] HWP 텍스트 추출 실패: {e}")
-        return ""
+    except Exception:
+        try:
+            subprocess.run(["hwp5txt", "--output", txt_path, file_path], check=True, capture_output=True)
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except Exception:
+            pass
     finally:
         if os.path.exists(txt_path):
             os.remove(txt_path)
+            
+    # 2차 백업: 직접 인코딩 해제 (hwp5txt 실패 시)
+    if not text.strip():
+        try:
+            with open(file_path, 'rb') as f:
+                content = f.read()
+                decoded = content.decode('utf-16le', errors='ignore')
+                hangul_only = re.sub(r'[^가-힣0-9a-zA-Z\s.,]', ' ', decoded)
+                text = ' '.join(hangul_only.split())
+        except Exception:
+            pass
+
+    return text
 
 def summarize(text):
-    """OpenAI API를 이용하여 텍스트를 요약합니다."""
-    if not text or len(text.strip()) < 50: 
-        return "본문 텍스트를 읽을 수 없거나 내용이 부족합니다."
+    if not text or len(text.strip()) < 30: 
+        return "본문 텍스트를 파싱하지 못해 요약할 수 없습니다."
     
     try:
         response = client.chat.completions.create(
@@ -117,12 +146,10 @@ def summarize(text):
 
 def main():
     setup()
-    
-    # 1. 기존 저장된 데이터 읽기
     existing_data = load_existing_data()
     existing_urls = {item['detail_url'] for item in existing_data}
     
-    print(f"=== 기존 데이터 {len(existing_data)}개 로드 완료. 신규 의안 수집을 시작합니다. ===")
+    print(f"=== 기존 데이터 {len(existing_data)}개 로드 완료. 수집을 시작합니다. ===")
 
     new_bills_data = []
     page = 1
@@ -133,32 +160,29 @@ def main():
         bills = get_bills(page)
         
         if not bills:
-            print("더 이상 의안이 없습니다.")
             break
             
         all_bills_in_page_already_exist = True
         
         for i, bill in enumerate(bills):
-            # 2. 이미 수집된 의안인지 URL 비교
             if bill['url'] in existing_urls:
                 print(f" ({i+1}/{len(bills)}) [기존 의안 - 스킵] {bill['title']}")
                 continue
             
-            # 3. 신규 의안 감지 시 수집 및 요약 진행
             all_bills_in_page_already_exist = False
-            print(f" ({i+1}/{len(bills)}) ✨ [신규 의안 발견] {bill['title']}")
+            print(f" ({i+1}/{len(bills)}) ✨ [수집 진행] {bill['title']}")
             
             file_path, file_down_url = download_file(bill['url'])
+            summary = "원안 첨부파일을 내려받지 못했습니다."
             
-            summary = "원안 첨부파일이 없거나 읽을 수 없습니다."
             if file_path:
-                if file_path.lower().endswith('.hwp'):
-                    text = extract_hwp_text(file_path)
-                    if text:
-                        summary = summarize(text)
-                        print("   └ 요약 완료")
+                text = extract_hwp_text(file_path)
+                if text:
+                    summary = summarize(text)
+                    print("   └ 요약 성공")
                 else:
-                    print("   └ HWP 형식이 아닌 파일입니다.")
+                    summary = "HWP 파일 텍스트 추출 실패"
+                    print("   └ 텍스트 추출 실패")
 
             new_bills_data.append({
                 "title": bill['title'],
@@ -168,22 +192,20 @@ def main():
                 "summary": summary
             })
 
-        # 4. 탐색 종료 조건: 한 페이지 전체가 이미 저장된 의안인 경우 이후 페이지 탐색 생략
         if all_bills_in_page_already_exist and len(bills) > 0:
-            print(f"\n페이지 {page}의 모든 의안이 이미 수집되어 있습니다. 크롤링을 종료합니다.")
+            print(f"\n페이지 {page}의 모든 의안이 이미 수집되어 크롤링을 종료합니다.")
             stop_crawling = True
             break
             
         page += 1
 
-    # 5. 신규 데이터가 존재하는 경우에만 기존 데이터 상단(최신순)에 합쳐서 저장
     if new_bills_data:
         final_data = new_bills_data + existing_data
         with open(JSON_OUT, 'w', encoding='utf-8') as f:
             json.dump(final_data, f, ensure_ascii=False, indent=2)
-        print(f"\n[완료] 신규 의안 {len(new_bills_data)}개가 추가되어 총 {len(final_data)}개 데이터가 저장되었습니다.")
+        print(f"\n[완료] 총 {len(final_data)}개 데이터 저장 완료.")
     else:
-        print("\n[알림] 새로 제출된 의안이 없습니다. 기존 데이터를 유지합니다.")
+        print("\n[알림] 추가할 신규 의안이 없습니다.")
 
 if __name__ == '__main__':
     main()
