@@ -1,9 +1,9 @@
 import os
 import re
-import sys
 import json
 import urllib.parse
-import subprocess
+import zlib
+import olefile
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
@@ -46,29 +46,21 @@ def get_bills(page):
     return bill_list
 
 def download_file(detail_url):
-    """유연한 다운로드 링크 수집 및 주소 직접 구성 백업 함수"""
+    """상세 페이지 접속 후 첨부파일(act=down1) 다운로드"""
     res = requests.get(detail_url, headers=HEADERS)
     soup = BeautifulSoup(res.text, 'html.parser')
     
-    down_url = None
-    # 1. 태그 내 다운로드 관련 링크 탐색
-    for a in soup.find_all('a'):
-        href = a.get('href', '')
-        onclick = a.get('onclick', '')
-        text = a.text.strip()
-        
-        if 'down' in href.lower() or 'down' in onclick.lower() or '원안' in text or '첨부' in text:
-            if href and not href.startswith('javascript'):
-                down_url = BOARD_URL + href if href.startswith('?') else (href if href.startswith('http') else BASE_URL + href)
-                break
-                
-    # 2. 링크를 찾지 못한 경우 URL 파라미터 기반 자동 생성 (act=view -> act=down1)
-    if not down_url:
+    down_link = soup.find('a', href=re.compile(r'act=down1'))
+    if not down_link:
+        # 다운로드 버튼 태그를 찾지 못한 경우 직접 URL 파라미터 구성
         down_url = detail_url.replace('act=view', 'act=down1') + '&judgingNo=1&judgingType=02'
+    else:
+        href = down_link.get('href')
+        down_url = BOARD_URL + href if href.startswith('?') else BASE_URL + href
 
     try:
         file_res = requests.get(down_url, headers=HEADERS, stream=True)
-        if file_res.status_code != 200 or len(file_res.content) < 1000:
+        if file_res.status_code != 200 or len(file_res.content) < 500:
             return None, None
 
         filename = "bill_file.hwp"
@@ -87,47 +79,50 @@ def download_file(detail_url):
 
         return save_path, down_url
     except Exception as e:
-        print(f"   └ [다운로드 에러]: {e}")
+        print(f"   └ [다운로드 실패]: {e}")
         return None, None
 
 def extract_hwp_text(file_path):
-    """hwp5txt 실행 및 바이너리 직접 분석을 포함한 이중 텍스트 추출"""
-    txt_path = file_path + ".txt"
-    text = ""
-    
-    # 1차: pyhwp / hwp5txt 도구 활용
-    try:
-        cmd = [sys.executable, "-m", "hwp5.hwp5txt", "--output", txt_path, file_path]
-        subprocess.run(cmd, check=True, capture_output=True)
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-    except Exception:
-        try:
-            subprocess.run(["hwp5txt", "--output", txt_path, file_path], check=True, capture_output=True)
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-        except Exception:
-            pass
-    finally:
-        if os.path.exists(txt_path):
-            os.remove(txt_path)
-            
-    # 2차 백업: 직접 인코딩 해제 (hwp5txt 실패 시)
-    if not text.strip():
-        try:
-            with open(file_path, 'rb') as f:
-                content = f.read()
-                decoded = content.decode('utf-16le', errors='ignore')
-                hangul_only = re.sub(r'[^가-힣0-9a-zA-Z\s.,]', ' ', decoded)
-                text = ' '.join(hangul_only.split())
-        except Exception:
-            pass
+    """olefile과 zlib를 사용하여 파이썬 내부에서 HWP 본문 텍스트를 직접 추출합니다."""
+    if not olefile.isOleFile(file_path):
+        return ""
 
-    return text
+    text = ""
+    try:
+        ole = olefile.OleFileIO(file_path)
+        dirs = ole.listdir()
+        
+        # HWP 문서의 본문 텍스트가 담긴 BodyText 섹션 탐색
+        sections = [d for d in dirs if d[0] == 'BodyText']
+        
+        for section in sections:
+            stream = ole.openstream(section)
+            data = stream.read()
+            
+            # HWP 5.0 압축 해제
+            try:
+                decompressed = zlib.decompress(data, -15)
+            except Exception:
+                try:
+                    decompressed = zlib.decompress(data)
+                except Exception:
+                    decompressed = data
+            
+            # UTF-16LE 텍스트 복원 및 한글/영문 추출
+            decoded = decompressed.decode('utf-16le', errors='ignore')
+            clean_text = re.sub(r'[^가-힣0-9a-zA-Z\s.,\-\(\)]', ' ', decoded)
+            text += ' '.join(clean_text.split()) + "\n"
+            
+        ole.close()
+        return text
+    except Exception as e:
+        print(f"   └ [HWP 읽기 실패]: {e}")
+        return ""
 
 def summarize(text):
+    """OpenAI API를 사용해 의안을 요약합니다."""
     if not text or len(text.strip()) < 30: 
-        return "본문 텍스트를 파싱하지 못해 요약할 수 없습니다."
+        return "본문 텍스트를 읽을 수 없어 요약에 실패했습니다."
     
     try:
         response = client.chat.completions.create(
@@ -135,7 +130,7 @@ def summarize(text):
             messages=[
                 {
                     "role": "system", 
-                    "content": "너는 지방의회 의안 분석 전문가야. 주어진 텍스트에서 '제안 이유'와 '주요 내용'을 파악하여 핵심을 3개 내외의 글머리 기호(Bullet points)로 요약해줘."
+                    "content": "너는 지방의회 의안 분석 전문가야. 주어진 텍스트에서 '제안 이유'와 '주요 내용'을 파악하여 핵심을 3개 내외의 글머리 기호(Bullet points)로 간결하게 요약해줘."
                 },
                 {"role": "user", "content": text[:3000]}
             ]
@@ -149,7 +144,7 @@ def main():
     existing_data = load_existing_data()
     existing_urls = {item['detail_url'] for item in existing_data}
     
-    print(f"=== 기존 데이터 {len(existing_data)}개 로드 완료. 수집을 시작합니다. ===")
+    print(f"=== 제주도의회 수집 시작 (기존 수집건: {len(existing_data)}개) ===")
 
     new_bills_data = []
     page = 1
@@ -166,23 +161,25 @@ def main():
         
         for i, bill in enumerate(bills):
             if bill['url'] in existing_urls:
-                print(f" ({i+1}/{len(bills)}) [기존 의안 - 스킵] {bill['title']}")
+                print(f" ({i+1}/{len(bills)}) [기존 건 스킵] {bill['title']}")
                 continue
             
             all_bills_in_page_already_exist = False
-            print(f" ({i+1}/{len(bills)}) ✨ [수집 진행] {bill['title']}")
+            print(f" ({i+1}/{len(bills)}) ⚙️ [수집 및 요약 중] {bill['title']}")
             
             file_path, file_down_url = download_file(bill['url'])
-            summary = "원안 첨부파일을 내려받지 못했습니다."
             
             if file_path:
                 text = extract_hwp_text(file_path)
                 if text:
                     summary = summarize(text)
-                    print("   └ 요약 성공")
+                    print("   └ ✅ 요약 성공")
                 else:
-                    summary = "HWP 파일 텍스트 추출 실패"
-                    print("   └ 텍스트 추출 실패")
+                    summary = "HWP 파일 내 텍스트 추출에 실패했습니다."
+                    print("   └ ❌ 텍스트 추출 실패")
+            else:
+                summary = "본 의안은 원안 첨부파일이 제공되지 않는 의안입니다."
+                print("   └ ⚪ 첨부파일 없음")
 
             new_bills_data.append({
                 "title": bill['title'],
@@ -193,7 +190,7 @@ def main():
             })
 
         if all_bills_in_page_already_exist and len(bills) > 0:
-            print(f"\n페이지 {page}의 모든 의안이 이미 수집되어 크롤링을 종료합니다.")
+            print(f"\n페이지 {page}의 모든 데이터가 이미 수집되어 종료합니다.")
             stop_crawling = True
             break
             
@@ -203,9 +200,9 @@ def main():
         final_data = new_bills_data + existing_data
         with open(JSON_OUT, 'w', encoding='utf-8') as f:
             json.dump(final_data, f, ensure_ascii=False, indent=2)
-        print(f"\n[완료] 총 {len(final_data)}개 데이터 저장 완료.")
+        print(f"\n[완료] 총 {len(final_data)}개 저장 완료.")
     else:
-        print("\n[알림] 추가할 신규 의안이 없습니다.")
+        print("\n[알림] 추가된 신규 의안이 없습니다.")
 
 if __name__ == '__main__':
     main()
